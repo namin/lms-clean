@@ -584,10 +584,22 @@ class GraphBuilderOpt extends GraphBuilder {
       }})
 
     // x[i] = y; ....; x[i] => x[i] = y; ....; y    side condition: no write in-between!
-    case ("array_get", List(as:Exp,i:Exp)) =>
-      curEffects.get(as).flatMap({ case (lw, _) => findDefinition(lw) collect {
-        case Node(_, "array_set", List(_, i2: Exp, value: Exp), _) if i == i2 => value
-      }})
+    case ("array_get", List(as:Exp,i:Exp)) => {
+      def rec(x: Sym): Option[Exp] = {
+        findDefinition(x).flatMap({
+          case Node(_, "array_set", List(_, i2: Exp, value: Exp), es) =>
+            (i,i2) match {
+              case _ if i == i2 => Some(value)
+              case (Const(c),Const(c2)) if c != c2 && es.hdeps.size==1 =>
+                rec(es.hdeps.toSeq.head)
+              case _ => None
+            }
+          // TODO: should we allow skip over some?
+          case _ => None
+        })
+      }
+      curEffects.get(as).flatMap({ case (x, _) => rec(x) })
+    }
 
     case ("array_slice", List(as: Exp, Const(0), Const(-1))) => Some(as)
     case ("array_length", List(Def("NewArray", Const(n)::_))) =>
