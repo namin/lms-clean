@@ -251,6 +251,7 @@ class ExtendedCCodeGen extends CompactCodeGen with ExtendedCodeGen {
     import java.nio.file.StandardCopyOption._
 
     val classLoader = getClass.getClassLoader
+    /*
     val src = Paths.get(classLoader.getResource("headers").getFile)
     val dst = Paths.get(System.getProperty("user.dir")).resolve("headers")
     var srcSum = 0; Files.walk(src).forEach {f => srcSum += 1};
@@ -263,6 +264,7 @@ class ExtendedCCodeGen extends CompactCodeGen with ExtendedCodeGen {
     }
 
     registerIncludePath(dst.toString)
+     */
   }
 
   def emitHeaders(out: PrintStream) = headers.foreach { f =>
