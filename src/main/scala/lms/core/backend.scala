@@ -594,7 +594,9 @@ class GraphBuilderOpt extends GraphBuilder {
                 rec(es.hdeps.toSeq.head)
               case _ => None
             }
-          case Node(_, _, _, es) => rec(es.hdeps.toSeq.head)
+          case Node(_, _, _, es) if es.hdeps.size==1 =>
+            rec(es.hdeps.toSeq.head)
+          case _ => None
         })
       }
       curEffects.get(as).flatMap({ case (x, _) => rec(x) })
