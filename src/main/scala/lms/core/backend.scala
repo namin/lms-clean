@@ -594,8 +594,7 @@ class GraphBuilderOpt extends GraphBuilder {
                 rec(es.hdeps.toSeq.head)
               case _ => None
             }
-          // TODO: should we allow skip over some?
-          case _ => None
+          case Node(_, _, _, es) => rec(es.hdeps.toSeq.head)
         })
       }
       curEffects.get(as).flatMap({ case (x, _) => rec(x) })
