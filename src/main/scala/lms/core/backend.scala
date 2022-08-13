@@ -138,9 +138,13 @@ object Backend {
   }
 
   case class BlockEffect(var map: Map[Exp,(Sym, List[Sym])], prev: BlockEffect) {
+    var allEff: Map[Exp, List[(Sym, List[Sym])]] = Map()
     def get(key: Exp): Option[(Sym, List[Sym])] = if (prev != null) map.get(key) orElse prev.get(key) else map.get(key)
     def getOrElse(key: Exp, default: (Sym, List[Sym])) = get(key).getOrElse(default)
-    def +=(kv: (Exp, (Sym, List[Sym]))) = map += kv
+    def +=(kv: (Exp, (Sym, List[Sym]))) = {
+      allEff = allEff + (kv._1 -> (kv._2::(allEff.getOrElse(kv._1, List()))))
+      map += kv
+    }
   }
 
 }
@@ -169,7 +173,15 @@ class GraphBuilder {
   }
   def findDefinition(op: String, as: Seq[Def]): Option[Node] = globalDefsReverseCache.get((op,as))
 
-  def rewrite(s: String, as: List[Def]): Option[Exp] = None
+  var __rewrites: (String => Any => Option[Exp]) = (s => x => None)
+
+  def rewrite(s: String, as: List[Def]): Option[Exp] = __rewrites("")((s, as))
+
+  def addRewrite(f: PartialFunction[Any, Option[Exp]]) = {
+    val old = __rewrites
+    val f1 = ((x: Any) => if (f.isDefinedAt(x)) f(x) else None)
+    __rewrites = (s =>x => f1(x).orElse(old(s)(x)))
+  }
 
   def reflect(s: String, as: Def*): Exp = {
     reflectEffect(s, as:_*)()()
@@ -216,7 +228,7 @@ class GraphBuilder {
 
   def isCurrentValue(src: Exp, value: Sym) = !curEffects.get(src).filter({ case (_, lrs) => lrs contains value }).isEmpty
   // This is the main function for reflect with explicit read/write effects
-  def reflectEffect(s: String, as: Def*)(readEfKeys: Exp*)(writeEfKeys: Exp*): Exp = {
+  def reflectEffect(sm: Sym, s: String, as: Def*)(readEfKeys: Exp*)(writeEfKeys: Exp*): Exp = {
     // simple pre-construction optimization
     rewrite(s, as.toList) match {
       case Some(e) => e // found optimization (resulting in pure expressions only)
@@ -228,7 +240,6 @@ class GraphBuilder {
         val writes = if (s == "reset1") _writes filter (_ != stub.Adapter.CPS) else _writes
 
         if (reads.nonEmpty || writes.nonEmpty) {
-          val sm = Sym(fresh)
           val (prevHard, prevSoft) = gatherEffectDeps(reads, writes, s, as:_*)
           // prevSoft --= prevHard
           val summary = EffectSummary(prevSoft, prevHard, reads, writes)
@@ -248,10 +259,13 @@ class GraphBuilder {
           findDefinition(s,as) match {
             case Some(n) => n.n
             case None =>
-              reflect(Sym(fresh), s, as:_*)()
+              reflect(sm, s, as:_*)()
           }
         }
     }
+  }
+  def reflectEffect(s: String, as: Def*)(readEfKeys: Exp*)(writeEfKeys: Exp*): Exp = {
+    reflectEffect(Sym(fresh), s, as:_*)(readEfKeys:_*)(writeEfKeys:_*)
   }
 
   def gatherEffectDeps(reads: Set[Exp], writes: Set[Exp], s: String, as: Def*): (Set[Sym], Set[Sym]) = {
@@ -512,16 +526,16 @@ class GraphBuilderOpt extends GraphBuilder {
 
   // fine grained dependency computation for array
   override def gatherEffectDepsWrite(s: String, as: Seq[Def], lw: Sym, lr: Seq[Sym]): (Set[Sym], Set[Sym]) =
-  findDefinition(latest(lw)) match {
-    case Some(Node(_, "array_set", as2, deps)) if (s == "array_set" && as.init == as2.init) =>
-      // If latest(lw) is setting the same array at the same index, we do not add hard dependence but soft dependence
-      // In addition, we need to inherite the soft and hard deps of latest(lw)
-      (deps.sdeps + latest(lw), deps.hdeps)
-    case _ => super.gatherEffectDepsWrite(s, as, lw, lr)
-  }
+    findDefinition(latest(lw)) match {
+      case Some(Node(_, "array_set", as2, deps)) if (s == "array_set" && as.init == as2.init) =>
+        // If latest(lw) is setting the same array at the same index, we do not add hard dependence but soft dependence
+        // In addition, we need to inherite the soft and hard deps of latest(lw)
+        (deps.sdeps + latest(lw), deps.hdeps)
+      case _ => super.gatherEffectDepsWrite(s, as, lw, lr)
+    }
 
   // graph pre-node-construction optimization
-  override def rewrite(s: String, as: List[Def]): Option[Exp] = (s,as) match {
+  addRewrite {
     // staticData(as)(i) => staticData(as(i))
     case ("array_get", List(Def("staticData", List(Const(as: Array[_]))), Const(i:Int))) =>
       as(i) match {
@@ -600,7 +614,12 @@ class GraphBuilderOpt extends GraphBuilder {
       }
       curEffects.get(as).flatMap({ case (x, _) => rec(x) })
     }
-
+/*
+    case ("array_get", List(as:Exp,i:Exp)) =>
+      curEffects.get(as).flatMap({ case (lw, _) => findDefinition(lw) collect {
+        case Node(_, "array_set", List(_, i2: Exp, value: Exp), _) if i == i2 => value
+      }})
+ */
     case ("array_slice", List(as: Exp, Const(0), Const(-1))) => Some(as)
     case ("array_length", List(Def("NewArray", Const(n)::_))) =>
       Some(Const(n))
@@ -654,9 +673,8 @@ class GraphBuilderOpt extends GraphBuilder {
       case (Const(t: Boolean), Const(e: Boolean)) /* if t != e */ => Some(if (t) c else reflect("!", c))
       case _ => None
     }
-
-    case _  =>
-      super.rewrite(s,as)
+    //case _  =>
+    //  super.rewrite(s,as)
   }
 
   // From miniscala CPSOptimizer.scala
@@ -682,8 +700,17 @@ class GraphBuilderOpt extends GraphBuilder {
     case ("-", List(Const(a:Int),Const(b:Int))) => Const(a-b)
     case ("*", List(Const(a:Int),Const(b:Int))) => Const(a*b)
     case ("/", List(Const(a:Int),Const(b:Int))) => Const(a/b)
+
+    case ("+", List(Const(a:Long),Const(b:Long))) => Const(a+b)
+    case ("-", List(Const(a:Long),Const(b:Long))) => Const(a-b)
+    case ("*", List(Const(a:Long),Const(b:Long))) => Const(a*b)
     case ("/", List(Const(a:Long),Const(b:Long))) => Const(a/b)
+
+    case ("+", List(Const(a:Double),Const(b:Double))) => Const(a+b)
+    case ("-", List(Const(a:Double),Const(b:Double))) => Const(a-b)
+    case ("*", List(Const(a:Double),Const(b:Double))) => Const(a*b)
     case ("/", List(Const(a:Double),Const(b:Double))) => Const(a/b)
+
     case ("%", List(Const(a:Int),Const(b:Int))) => Const(a%b)
     case (">>>", List(Const(a: Int),Const(b:Int))) => Const(a >>> b)
     case (">>>", List(Const(a: Long),Const(b:Int))) => Const(a >>> b)
@@ -773,36 +800,45 @@ class DeadCodeElimCG extends Phase {
 
   def apply(g: Graph): Graph = utils.time("DeadCodeElimCG") {
 
-    live = new mutable.HashSet[Sym]
-    reach = new mutable.HashSet[Sym]
+    val s_live = new mutable.BitSet
+    val s_reach = new mutable.BitSet
     statics = new mutable.HashSet[Node]
     var newNodes: List[Node] = Nil
-    val used = new mutable.HashSet[Exp]
+    val used = new mutable.BitSet
     var size = 0
 
     // First pass liveness and reachability
     // Only a single pass that reduce input size and first step of the next loop
     utils.time("A_First_Path") {
-      reach ++= g.block.used
+      s_reach ++= g.block.used.map(_.n)
       if (g.block.res.isInstanceOf[Sym]) {
-        live += g.block.res.asInstanceOf[Sym]
-        used += g.block.res.asInstanceOf[Sym]
+        s_live += g.block.res.asInstanceOf[Sym].n
+        used += g.block.res.asInstanceOf[Sym].n
       }
-      used ++= g.block.bound
+      used ++= g.block.bound.map(_.n)
       for (d <- g.nodes.reverseIterator) {
-        if (reach(d.n)) {
+        if (s_reach(d.n.n)) {
           val nn = d match {
-            case n @ Node(s, "?", c::(a:Block)::(b:Block)::t, eff) if !live(s) =>
+            case n @ Node(s, "?", c::(a:Block)::(b:Block)::t, eff) if !s_live(s.n) =>
               n.copy(rhs = c::a.copy(res = Const(()))::b.copy(res = Const(()))::t) // remove result deps if dead
             case _ => d
           }
-          live ++= valueSyms(nn)
-          reach ++= hardSyms(nn)
+          s_live ++= valueSyms(nn).map(_.n)
+          s_reach ++= hardSyms(nn).map(_.n)
 
           newNodes = nn::newNodes
         }
       }
     }
+
+    live = s_live.toList.map(Sym(_)).toSet
+    reach = s_reach.toList.map(Sym(_)).toSet
+
+    val filterSym : Exp => Boolean =
+      exp => exp match {
+       case(Sym(_)) => true
+       case _ => false
+      }
 
     // Second pass remove unused variables
     var idx: Int = 1
@@ -810,32 +846,38 @@ class DeadCodeElimCG extends Phase {
       utils.time(s"Extra_Path_$idx") {
         size = used.size
         for (d <- newNodes.reverseIterator) {
-          if (used(d.n)) {
-            used ++= valueSyms(d)
-          } else if (d.eff.hasSimpleEffect || d.eff.wkeys.exists(used)) {
-            used += d.n
-            used ++= valueSyms(d)
+          if (used(d.n.n)) {
+            used ++= valueSyms(d).map(_.n)
+          } else if (d.eff.hasSimpleEffect || d.eff.wkeys.filter(filterSym).map(_.asInstanceOf[Sym].n).exists(used)) {
+            used += d.n.n
+            used ++= valueSyms(d).map(_.n)
           }
         }
       }
       idx += 1
     }
 
+    val filterkey : Exp => Boolean =
+      key => key match {
+        case Sym(n) => used(n)
+        case _ => true
+      }
+
     utils.time(s"Recreate_the_graph") {
       var newGlobalDefsCache = Map[Sym,Node]()
-      newNodes = for (d <- newNodes if used(d.n)) yield {
+      newNodes = for (d <- newNodes if used(d.n.n)) yield {
         newGlobalDefsCache += d.n -> d
         if (d.op == "staticData") statics += d
         if (fixDeps)
           d.copy(rhs = d.rhs.map {
-            case b: Block => b.copy(eff = b.eff.filter(used))
+            case b: Block => b.copy(eff = b.eff.filter(filterkey))
             case o => o
-          }, eff = d.eff.filter(used))
+          }, eff = d.eff.filter(filterkey))
         else
           d
       }
       val newBlock = if (fixDeps)
-        g.block.copy(eff = g.block.eff.filter(used))
+        g.block.copy(eff = g.block.eff.filter(filterkey))
       else
         g.block
 
