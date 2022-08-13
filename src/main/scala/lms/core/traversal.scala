@@ -471,7 +471,6 @@ class CompactTraverser extends Traverser {
   }
 }
 
-
 abstract class Transformer extends Traverser {
   val name: String = "Transformer"
 
@@ -481,28 +480,35 @@ abstract class Transformer extends Traverser {
 
   def transform(s: Exp): Exp = s match {
     case s @ Sym(_) if subst contains s => subst(s)
-    case s @ Sym(_) => println(s"Warning: not found in subst $subst: "+s); s
-    case a => a // must be const
+    case s @ Sym(_) =>
+      throw new Exception("not found in subst: "+s)
+    case s @ Const(_) =>
+      if (Adapter.oldTypeMap != null && Adapter.oldTypeMap.contains(s)) {
+        Adapter.typeMap(s) = Adapter.oldTypeMap(s)
+      }
+      s
   }
 
-  def transform(b: Block): Block = b match {
-    case b @ Block(Nil, res, block, eff) =>
-      g.reify {
+  def transform(b: Block): Block = {
+    val Block(args, res, block, eff) = b
+    g.reify(args.size, { es =>
+      args.filter(subst.contains(_)).foreach { a =>
+        println(s"Warning: already have a subst for $a")
+      }
+      try {
+        args.zipWithIndex.foreach { case (e, i) =>
+          if (Adapter.oldTypeMap.contains(args(i))) {
+            Adapter.typeMap(es(i)) = Adapter.oldTypeMap(args(i))
+          }
+          subst(args(i)) = es(i)
+        }
         //subst(block) = g.effectToExp(g.curBlock) //XXX
-        traverse(b); transform(res)
+        traverse(b)
+        transform(res)
+      } finally {
+        //subst --= args
       }
-    case b @ Block(arg::Nil, res, block, eff) =>
-      g.reify { e =>
-        if (subst contains arg)
-          println(s"Warning: already have a subst for $arg")
-        try {
-          subst(arg) = e
-          //subst(block) = g.effectToExp(g.curBlock) //XXX
-          traverse(b)
-          transform(res)
-        } finally subst -= arg
-      }
-    case _ => ???
+    })
   }
 
   def transformRHS(rhs: List[Def]) = rhs.map {
@@ -513,18 +519,20 @@ abstract class Transformer extends Traverser {
 
   def transform(n: Node): Exp = n match {
     case Node(s, "λ", (b @ Block(in, y, ein, eff))::rest, _) =>
-      // need to deal with recursive binding!
-      val s1 = Sym(g.fresh)
-      subst(s) = s1
-      g.reflect(s1, "λ", (transform(b)+:transformRHS(rest)):_*)()
+      // need to deal with recursive binding! yes!
+      val s1 = subst(s).asInstanceOf[Sym]
+      if (!g.globalDefsCache.contains(s1))
+        g.reflect(s1, "λ", (transform(b)+:transformRHS(rest)):_*)()
+      else s1
     case Node(s,op,rs,es) =>
       // effect dependencies in target graph are managed by
       // graph builder, so we drop all effects here
       val (effects,pure) = (es.deps,rs)
       val args = transformRHS(pure)
       // NOTE: we're not transforming 'effects' here (just the keys)
-      if (effects.nonEmpty)
+      if (effects.nonEmpty) {
         g.reflectEffect(op,args:_*)(es.rkeys.map(transform).toSeq:_*)(es.wkeys.map(transform).toSeq:_*)
+      }
       else
         g.reflect(op,args:_*)
   }
@@ -545,6 +553,13 @@ abstract class Transformer extends Traverser {
   def transform(graph: Graph): Graph = {
     // XXX unfortunate code duplication, either
     // with traverser or with transform(Block)
+    for (n <- graph.nodes) {
+      n match {
+        case Node(s, "λ", (b @ Block(in, y, ein, eff))::rest, _) =>
+          subst(s) = Sym(g.fresh)
+        case _ =>
+      }
+    }
 
     // Handling MetaData 1. save oldTypeMap/SourceMap first
     Adapter.oldDefsCache = graph.globalDefsCache
@@ -565,12 +580,16 @@ abstract class Transformer extends Traverser {
 
     // Handling MetaData 3. update new metadata with old metadata
     // this is not redundant because of the block arguments (function definitions)
-    for ((k, v) <- subst if v.isInstanceOf[Sym] && Adapter.oldTypeMap != null && Adapter.oldTypeMap.contains(k))
-      Adapter.typeMap.getOrElseUpdate(v, Adapter.oldTypeMap(k))
-    for ((k, v) <- subst if v.isInstanceOf[Sym] && Adapter.oldSourceMap != null && Adapter.oldSourceMap.contains(k))
-      Adapter.sourceMap.getOrElseUpdate(v, Adapter.oldSourceMap(k))
+    if (Adapter.oldTypeMap != null) {
+      for ((k, v) <- subst if v.isInstanceOf[Sym] && Adapter.oldTypeMap.contains(k))
+        Adapter.typeMap.getOrElseUpdate(v, Adapter.oldTypeMap(k))
+    }
+    if (Adapter.oldSourceMap != null) {
+      for ((k, v) <- subst if v.isInstanceOf[Sym] && Adapter.oldSourceMap.contains(k))
+        Adapter.sourceMap.getOrElseUpdate(v, Adapter.oldSourceMap(k))
+    }
 
-    Graph(g.globalDefs,block, g.globalDefsCache.toMap)
+    Graph(g.globalDefs, block, g.globalDefsCache.toMap)
   }
 
 }
